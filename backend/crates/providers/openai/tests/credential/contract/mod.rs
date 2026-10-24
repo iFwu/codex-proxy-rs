@@ -810,6 +810,85 @@ async fn selector_should_claim_the_initial_session_account_before_upstream_send(
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn session_affinity_slow_operations_succeed_within_the_deadline() {
+    for operation in ["load", "compare_and_bind"] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_first", "at-first");
+        let affinity = Arc::new(
+            MemorySessionAffinity::default()
+                .with_operation_delay(operation, Duration::from_millis(200)),
+        );
+        let selector = selector_with_affinity(
+            &store,
+            Arc::new(TestLeaseCoordinator::default()),
+            Arc::clone(&affinity),
+        );
+        let key = ProviderSessionAffinityKey::try_new("slow-session").unwrap();
+        let request_attempt = attempt(BTreeSet::new());
+        let request_url = Url::parse(OFFICIAL_CODEX_BASE_URL).unwrap();
+        let started = tokio::time::Instant::now();
+        let selected = selector
+            .select(&SelectCodexCredential {
+                upstream_model: "gpt-5.4",
+                request_url: &request_url,
+                attempt: &request_attempt,
+                session_affinity_key: Some(&key),
+            })
+            .await
+            .expect("a 200ms binding operation must succeed");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(selected.account_id().as_str(), "acct_first");
+        assert_eq!(affinity.binding_count(), 1);
+        assert_eq!(affinity.renewal_ttls().len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_affinity_deadline_is_fail_closed_without_reselection_or_binding() {
+    for operation in ["load", "compare_and_bind"] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_first", "at-first");
+        create_account(&store, "acct_second", "at-second");
+        let affinity = Arc::new(
+            MemorySessionAffinity::default()
+                .with_operation_delay(operation, Duration::from_millis(600)),
+        );
+        let leases = Arc::new(TestLeaseCoordinator::default());
+        let selector = selector_with_affinity(&store, Arc::clone(&leases), Arc::clone(&affinity));
+        let key = ProviderSessionAffinityKey::try_new("deadline-session").unwrap();
+        let request_attempt = attempt(BTreeSet::new());
+        let request_url = Url::parse(OFFICIAL_CODEX_BASE_URL).unwrap();
+        let started = tokio::time::Instant::now();
+        let error = selector
+            .select(&SelectCodexCredential {
+                upstream_model: "gpt-5.4",
+                request_url: &request_url,
+                attempt: &request_attempt,
+                session_affinity_key: Some(&key),
+            })
+            .await
+            .expect_err("a 600ms binding operation must fail closed");
+        assert!(matches!(
+            error,
+            CredentialSelectionError::SessionBound(source)
+                if matches!(*source, CredentialSelectionError::Store(_))
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_millis(600));
+        assert_eq!(affinity.lookup_keys().len(), 1);
+        assert_eq!(
+            leases.requests.lock().unwrap().len(),
+            usize::from(operation == "compare_and_bind"),
+            "a deadline must not attempt another account"
+        );
+        tokio::time::advance(Duration::from_millis(600)).await;
+        assert_eq!(affinity.binding_count(), 0);
+        assert!(affinity.renewal_ttls().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn record_success_should_not_overwrite_a_newer_session_winner() {
     let store = Arc::new(MemoryAccountStore::default());

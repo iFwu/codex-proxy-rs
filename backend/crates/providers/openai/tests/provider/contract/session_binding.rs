@@ -2,6 +2,102 @@
 
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn session_affinity_slow_alias_operations_preserve_turn_association() {
+    for operation in ["load_alias", "bind_alias"] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_subagent_a").await;
+        let affinity = Arc::new(
+            MemorySessionAffinity::default()
+                .with_operation_delay(operation, Duration::from_millis(200)),
+        );
+        let server = MockServer::start().await;
+        let provider = provider_with_affinity_and_base_url(&store, affinity.clone(), server.uri());
+        let started = tokio::time::Instant::now();
+        let root = provider
+            .clone()
+            .execute(
+                planned_request("openai", turn_request("root", "slow-turn")),
+                context("req_slow_turn", CancellationToken::new()),
+            )
+            .await
+            .expect("a 200ms alias operation must succeed");
+        let owner = root.metadata().provider_account_id().clone();
+        drop(root);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        let image = provider
+            .execute(
+                planned_provider_endpoint_request(
+                    "openai",
+                    image_for_turn(ImageRequestKind::Generation, "slow-turn"),
+                ),
+                context("req_slow_image", CancellationToken::new()),
+            )
+            .await
+            .expect("the image turn must retain the session owner");
+        assert_eq!(image.metadata().provider_account_id(), &owner);
+        assert_eq!(affinity.binding_count(), 1);
+        assert_eq!(affinity.alias_ttls().len(), 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_affinity_deadlines_prohibit_retry_and_preserve_the_existing_owner() {
+    use gateway_core::provider_ports::ProviderSessionAffinityKey;
+
+    for operation in ["load", "load_alias", "bind_alias", "compare_and_bind"] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_subagent_a").await;
+        create_account(&store, "acct_subagent_b").await;
+        let affinity = Arc::new(
+            MemorySessionAffinity::default()
+                .with_operation_delay(operation, Duration::from_millis(600)),
+        );
+        let server = MockServer::start().await;
+        let provider = provider_with_affinity_and_base_url(&store, affinity.clone(), server.uri());
+        let request = turn_request("root", "deadline-turn");
+        let key = ProviderSessionAffinityKey::try_new(
+            provider
+                .request_observation(
+                    &request,
+                    &ClientApiKeyId::new("key_openai_contract").unwrap(),
+                )
+                .continuation
+                .affinity_hash
+                .unwrap(),
+        )
+        .unwrap();
+        let provider_kind = ProviderKind::new("openai").unwrap();
+        let owner = ProviderAccountId::new("acct_subagent_a").unwrap();
+        affinity.seed_binding(&provider_kind, key.expose_to_store(), owner.clone());
+        let started = tokio::time::Instant::now();
+        let error = provider
+            .execute(
+                planned_request("openai", request),
+                context("req_affinity_deadline", CancellationToken::new()),
+            )
+            .await
+            .err()
+            .expect("a 600ms affinity operation must fail before upstream send");
+        assert_eq!(
+            error.kind(),
+            ProviderErrorKind::ProviderInfrastructureUnavailable
+        );
+        assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+        assert!(error.retry_is_prohibited());
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_millis(600));
+        tokio::time::advance(Duration::from_millis(600)).await;
+        assert_eq!(affinity.binding_count(), 1);
+        assert_eq!(
+            affinity.load(&provider_kind, &key).await.unwrap(),
+            Some(owner)
+        );
+        assert!(affinity.alias_ttls().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn cyber_policy_session_exclusion_has_actionable_non_retryable_error() {
     let store = Arc::new(MemoryAccountStore::default());
@@ -326,12 +422,15 @@ async fn assert_independent_session_can_claim(source: Option<&str>) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn concurrent_root_and_child_requests_claim_one_session_account() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_subagent_a").await;
     create_account(&store, "acct_subagent_b").await;
-    let affinity = Arc::new(MemorySessionAffinity::with_initial_claim_barrier(2));
+    let affinity = Arc::new(
+        MemorySessionAffinity::with_initial_claim_barrier(2)
+            .with_operation_delay("compare_and_bind", Duration::from_millis(200)),
+    );
     let provider = provider_with_affinity(&store, affinity.clone());
     let select = |thread| {
         provider.clone().execute(

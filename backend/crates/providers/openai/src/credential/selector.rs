@@ -46,7 +46,10 @@ const CLOUDFLARE_CHALLENGE_BACKOFF: [Duration; 4] = [
     Duration::from_secs(120),
 ];
 const CLOUDFLARE_PATH_BLOCK_THRESHOLD: u32 = 3;
-const SESSION_AFFINITY_TIMEOUT: Duration = Duration::from_millis(100);
+// 绑定不可用必须拒绝发送；放宽期限不应掩盖原有慢操作，也不改变 cyber policy 的 fail-open 预算
+const SESSION_AFFINITY_TIMEOUT: Duration = Duration::from_millis(500);
+const SESSION_AFFINITY_SLOW_THRESHOLD: Duration = Duration::from_millis(100);
+const CYBER_POLICY_TIMEOUT: Duration = Duration::from_millis(100);
 const CYBER_POLICY_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_ACCOUNT_SNAPSHOT_RETRIES: u32 = 3;
 const COOLDOWN_READ_CONCURRENCY: usize = 128;
@@ -1134,14 +1137,12 @@ impl CodexCredentialSelector {
             }
             alias = existing.alias_record();
         }
-        let applied = tokio::time::timeout(
-            SESSION_AFFINITY_TIMEOUT,
+        let applied = session_affinity_operation(
+            "bind_alias",
             self.session_affinity
                 .bind_alias(&self.provider_kind, turn, &alias, session_ttl),
         )
-        .await
-        .map_err(binding_store_error)?
-        .map_err(binding_store_error)?;
+        .await?;
         if !applied {
             return Err(CredentialSelectionError::SessionBound(Box::new(
                 CredentialSelectionError::NoEligibleCredential,
@@ -1154,13 +1155,11 @@ impl CodexCredentialSelector {
         &self,
         turn: &ProviderSessionAffinityKey,
     ) -> Result<Option<CodexSessionAffinity>, CredentialSelectionError> {
-        tokio::time::timeout(
-            SESSION_AFFINITY_TIMEOUT,
+        session_affinity_operation(
+            "load_alias",
             self.session_affinity.load_alias(&self.provider_kind, turn),
         )
         .await
-        .map_err(binding_store_error)?
-        .map_err(binding_store_error)
         .map(|alias| alias.map(|alias| CodexSessionAffinity::from_turn_alias(turn.clone(), alias)))
     }
 
@@ -1168,13 +1167,8 @@ impl CodexCredentialSelector {
         &self,
         key: &ProviderSessionAffinityKey,
     ) -> Result<Option<ProviderSessionBinding>, CredentialSelectionError> {
-        tokio::time::timeout(
-            SESSION_AFFINITY_TIMEOUT,
-            self.session_affinity.load(&self.provider_kind, key),
-        )
-        .await
-        .map_err(binding_store_error)?
-        .map_err(binding_store_error)
+        session_affinity_operation("load", self.session_affinity.load(&self.provider_kind, key))
+            .await
     }
 
     async fn admit_session(
@@ -1184,8 +1178,8 @@ impl CodexCredentialSelector {
         account: &ProviderAccountId,
         session_ttl: Duration,
     ) -> Result<bool, CredentialSelectionError> {
-        tokio::time::timeout(
-            SESSION_AFFINITY_TIMEOUT,
+        session_affinity_operation(
+            "compare_and_bind",
             self.session_affinity.compare_and_bind(
                 &self.provider_kind,
                 key,
@@ -1195,9 +1189,7 @@ impl CodexCredentialSelector {
             ),
         )
         .await
-        .map_err(binding_store_error)?
         .map(|binding| binding.is_some())
-        .map_err(binding_store_error)
     }
 
     async fn prepare_cyber_policy_scope(
@@ -1206,7 +1198,7 @@ impl CodexCredentialSelector {
     ) -> Option<CodexCyberPolicyScope> {
         let key = key?.clone();
         let state = match tokio::time::timeout(
-            SESSION_AFFINITY_TIMEOUT,
+            CYBER_POLICY_TIMEOUT,
             self.session_exclusions.load(&self.provider_kind, &key),
         )
         .await
@@ -1218,7 +1210,7 @@ impl CodexCredentialSelector {
             }
             Err(_) => {
                 tracing::warn!(
-                    timeout_ms = SESSION_AFFINITY_TIMEOUT.as_millis(),
+                    timeout_ms = CYBER_POLICY_TIMEOUT.as_millis(),
                     "OpenAI cyber policy state read timed out"
                 );
                 None
@@ -1236,7 +1228,7 @@ impl CodexCredentialSelector {
             return;
         };
         match tokio::time::timeout(
-            SESSION_AFFINITY_TIMEOUT,
+            CYBER_POLICY_TIMEOUT,
             self.session_exclusions.record_failure(
                 &self.provider_kind,
                 &scope.key,
@@ -1257,7 +1249,7 @@ impl CodexCredentialSelector {
             Err(_) => {
                 tracing::warn!(
                     account_id = %account.id(),
-                    timeout_ms = SESSION_AFFINITY_TIMEOUT.as_millis(),
+                    timeout_ms = CYBER_POLICY_TIMEOUT.as_millis(),
                     "OpenAI cyber policy exclusion write timed out"
                 );
             }
@@ -1272,7 +1264,7 @@ impl CodexCredentialSelector {
             return;
         };
         match tokio::time::timeout(
-            SESSION_AFFINITY_TIMEOUT,
+            CYBER_POLICY_TIMEOUT,
             self.session_exclusions
                 .clear(&self.provider_kind, &scope.key, state.revision()),
         )
@@ -1284,7 +1276,7 @@ impl CodexCredentialSelector {
             }
             Err(_) => {
                 tracing::warn!(
-                    timeout_ms = SESSION_AFFINITY_TIMEOUT.as_millis(),
+                    timeout_ms = CYBER_POLICY_TIMEOUT.as_millis(),
                     "OpenAI cyber policy exclusion clear timed out"
                 );
             }
@@ -1608,6 +1600,36 @@ impl CodexCredentialSelector {
         self.repository.compare_and_swap_data(account, data).await?;
         Ok(())
     }
+}
+
+async fn session_affinity_operation<T>(
+    operation: &'static str,
+    future: impl Future<Output = Result<T, ProviderStoreError>>,
+) -> Result<T, CredentialSelectionError> {
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(SESSION_AFFINITY_TIMEOUT, future).await;
+    let elapsed = started.elapsed();
+    let outcome = match &result {
+        Ok(Ok(_)) => "success",
+        Ok(Err(_)) => "store_error",
+        Err(_) => "deadline",
+    };
+    if elapsed >= SESSION_AFFINITY_SLOW_THRESHOLD || !matches!(&result, Ok(Ok(_))) {
+        // 沿用当前请求 span，只记录操作与耗时，不记录绑定、账号或原始存储错误
+        tracing::warn!(
+            operation,
+            outcome,
+            store_error_kind = ?result.as_ref().ok().and_then(|value| value.as_ref().err()).map(ProviderStoreError::kind),
+            elapsed_ms = elapsed.as_millis() as u64,
+            deadline_ms = SESSION_AFFINITY_TIMEOUT.as_millis() as u64,
+            deadline_overrun_ms = elapsed.saturating_sub(SESSION_AFFINITY_TIMEOUT).as_millis() as u64,
+            threshold_ms = SESSION_AFFINITY_SLOW_THRESHOLD.as_millis() as u64,
+            "OpenAI session affinity operation observed"
+        );
+    }
+    result
+        .map_err(binding_store_error)?
+        .map_err(binding_store_error)
 }
 
 fn binding_store_error(

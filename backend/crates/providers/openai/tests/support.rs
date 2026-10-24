@@ -774,6 +774,7 @@ impl ProviderLeasePort for TestLeaseCoordinator {
 #[derive(Default)]
 pub(crate) struct MemorySessionAffinity {
     initial_claim_barrier: Option<Arc<tokio::sync::Barrier>>,
+    operation_delay: Option<(&'static str, Duration)>,
     aliases: Mutex<BTreeMap<(String, String), gateway_core::provider_ports::ProviderSessionAlias>>,
     bindings:
         Mutex<BTreeMap<(String, String), gateway_core::provider_ports::ProviderSessionBinding>>,
@@ -787,6 +788,19 @@ impl MemorySessionAffinity {
         Self {
             initial_claim_barrier: Some(Arc::new(tokio::sync::Barrier::new(participants))),
             ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_operation_delay(mut self, operation: &'static str, delay: Duration) -> Self {
+        self.operation_delay = Some((operation, delay));
+        self
+    }
+
+    async fn delay_operation(&self, operation: &'static str) {
+        if let Some((delayed_operation, delay)) = self.operation_delay
+            && delayed_operation == operation
+        {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -857,6 +871,7 @@ impl ProviderSessionAffinityPort for MemorySessionAffinity {
                 .lock()
                 .expect("lookups")
                 .push(key.expose_to_store().to_owned());
+            self.delay_operation("load").await;
             Ok(self
                 .bindings
                 .lock()
@@ -881,6 +896,7 @@ impl ProviderSessionAffinityPort for MemorySessionAffinity {
         Result<Option<gateway_core::provider_ports::ProviderSessionBinding>, ProviderStoreError>,
     > {
         Box::pin(async move {
+            self.delay_operation("compare_and_bind").await;
             // 让并发首请求都读到空绑定，再验证发送前的原子认领冲突
             if expected.is_none()
                 && let Some(barrier) = &self.initial_claim_barrier
@@ -919,6 +935,7 @@ impl ProviderSessionAffinityPort for MemorySessionAffinity {
         Result<Option<gateway_core::provider_ports::ProviderSessionAlias>, ProviderStoreError>,
     > {
         Box::pin(async move {
+            self.delay_operation("load_alias").await;
             Ok(self
                 .aliases
                 .lock()
@@ -938,6 +955,7 @@ impl ProviderSessionAffinityPort for MemorySessionAffinity {
         ttl: Duration,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>> {
         Box::pin(async move {
+            self.delay_operation("bind_alias").await;
             let mut aliases = self.aliases.lock().unwrap();
             let current = aliases
                 .entry((
