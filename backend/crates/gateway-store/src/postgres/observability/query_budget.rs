@@ -111,16 +111,24 @@ impl ObservabilityQueryBudget {
         F: FnOnce(ObservabilityConnection) -> Q,
         Q: Future<Output = StoreResult<T>>,
     {
+        use crate::postgres::query_trace::trace_operation;
+
         tokio::time::timeout(self.query_timeout, async {
-            let permit = self.acquire(operation).await?;
-            let connection = pool.acquire().await.map_err(|source| {
-                postgres_unavailable("acquire observability connection", source)
-            })?;
-            query(ObservabilityConnection {
-                connection,
-                permit: Some(permit),
-                query_timeout: self.query_timeout,
-            })
+            let permit = trace_operation(operation, "semaphore", self.acquire(operation)).await?;
+            let connection = trace_operation(operation, "pool", pool.acquire())
+                .await
+                .map_err(|source| {
+                    postgres_unavailable("acquire observability connection", source)
+                })?;
+            trace_operation(
+                operation,
+                "execution",
+                query(ObservabilityConnection {
+                    connection,
+                    permit: Some(permit),
+                    query_timeout: self.query_timeout,
+                }),
+            )
             .await
         })
         .await

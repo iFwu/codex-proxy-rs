@@ -563,6 +563,15 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
    按配置的保留窗口及组织的数据处理要求管理已生成文件。不要为普通请求排查开启 OAuth 恢复记录，
    也不要直接上传整个日志目录或完整转储
 
+会话账号绑定的单次存储预算为 500ms；达到 100ms 或失败时记录操作名、结果、存储错误分类、耗时及超出预算的时长。
+快路径不逐条写日志，也不增加 Redis 探测命令；超时不代表写操作未执行，绑定结果未知时仍拒绝发送上游请求。cyber policy 的 fail-open 操作独立保留 100ms 预算。
+
+日志订阅者只接入已启用的输出，探测已关闭的 `request_dump` / `oauth_recovery` 不会误报启用或压掉后续应用告警。
+终态观测写入失败按 `request_id` 记录，`validation_reason` 只包含静态校验原因，`sqlstate` 只包含 PostgreSQL 错误分类；不输出原始错误链或 SQL 参数。
+其他写入失败保留累计计数采样。`request.finished` 表示执行结果，不证明异步终态已落库；出现写入失败时不要通过重放模型请求补偿。
+
+PostgreSQL 慢操作观测保留只读预算准入与后台批量结算，达到 100ms 或失败时才写静态阶段和耗时；不改变 SQL、事务、连接池、队列或取消边界。
+
 请求问题反馈使用 [接口问题反馈表单](../.github/ISSUE_TEMPLATE/api-bug-report.yml)；错误诊断与查询合同见
 [API 文档](../docs/api.md#10-dashboard用量与错误)
 

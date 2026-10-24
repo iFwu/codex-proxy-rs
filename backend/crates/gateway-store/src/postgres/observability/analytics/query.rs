@@ -930,23 +930,27 @@ impl<'a> AnalyticsSnapshot<'a> {
             counters,
             distribution_names,
         );
-        let mut rows = query.build().fetch(&mut *self.tx);
-        while let Some(row) = rows
-            .try_next()
-            .await
-            .map_err(|error| postgres_unavailable("aggregate analytics facts", error))?
-        {
-            let key = (get(&row, "bucket_start")?, get(&row, "name")?);
-            let state = MetricState::decode_aggregate(
-                &row,
-                exact && matches!(distributions, DistributionRead::Full),
-            )?;
-            if exact {
-                result.insert(key, state);
-            } else {
-                result.entry(key).or_default().merge(&state)?;
+        crate::postgres::query_trace::trace_operation("analytics_facts", "sql_and_decode", async {
+            let mut rows = query.build().fetch(&mut *self.tx);
+            while let Some(row) = rows
+                .try_next()
+                .await
+                .map_err(|error| postgres_unavailable("aggregate analytics facts", error))?
+            {
+                let key = (get(&row, "bucket_start")?, get(&row, "name")?);
+                let state = MetricState::decode_aggregate(
+                    &row,
+                    exact && matches!(distributions, DistributionRead::Full),
+                )?;
+                if exact {
+                    result.insert(key, state);
+                } else {
+                    result.entry(key).or_default().merge(&state)?;
+                }
             }
-        }
+            Ok::<_, StoreError>(())
+        })
+        .await?;
         Ok(result)
     }
 }

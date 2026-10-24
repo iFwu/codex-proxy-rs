@@ -3,6 +3,7 @@
 use gateway_admin::model::audit::MutationAuditOperation;
 use std::{collections::BTreeMap, time::Duration};
 
+use super::query_trace::trace_operation;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use gateway_admin::model::{
@@ -157,8 +158,11 @@ impl PgClientBudgetStore {
             .iter()
             .map(|charge| charge.request_id.as_str())
             .collect::<Vec<_>>();
-        let row = sqlx::query(
-            "select k.enabled, k.daily_limit_usd::text, k.weekly_limit_usd::text,
+        let row = trace_operation(
+            "client_budget_admit",
+            "read",
+            sqlx::query(
+                "select k.enabled, k.daily_limit_usd::text, k.weekly_limit_usd::text,
                 w.daily_start, w.daily_end, w.weekly_start, w.weekly_end,
                 coalesce(w.daily_used_usd, 0)::text as daily_used,
                 coalesce(w.weekly_used_usd, 0)::text as weekly_used,
@@ -167,10 +171,16 @@ impl PgClientBudgetStore {
                 end as persisted
             from client_api_keys k left join client_api_key_budget_windows w on w.client_api_key_id = k.id
             where k.id = $1",
+            )
+            .bind(key_id.as_str())
+            .bind(ids)
+            .fetch_optional(&self.pool),
         )
-        .bind(key_id.as_str()).bind(ids).fetch_optional(&self.pool).await
+        .await
         .map_err(|source| unavailable().with_source(source))?
-        .ok_or_else(|| GatewayError::new(GatewayErrorKind::Unauthorized, "client API key no longer exists"))?;
+        .ok_or_else(|| {
+            GatewayError::new(GatewayErrorKind::Unauthorized, "client API key no longer exists")
+        })?;
         if !row.get::<bool, _>("enabled") {
             return Err(GatewayError::new(
                 GatewayErrorKind::PolicyDenied,
@@ -257,22 +267,24 @@ impl PgClientBudgetStore {
         }
         // 首次使用或窗口到期才写入；与重置、结算保持相同锁序
         if open_daily || open_weekly {
-            let mut tx = self
-                .pool
-                .begin()
+            let mut tx = trace_operation("client_budget_open", "pool_begin", self.pool.begin())
                 .await
                 .map_err(|source| unavailable().with_source(source))?;
-            sqlx::query("select id from client_api_keys where id = $1 for update")
-                .bind(key_id.as_str())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|source| unavailable().with_source(source))?
-                .ok_or_else(|| {
-                    GatewayError::new(
-                        GatewayErrorKind::Unauthorized,
-                        "client API key no longer exists",
-                    )
-                })?;
+            trace_operation(
+                "client_budget_open",
+                "key_lock",
+                sqlx::query("select id from client_api_keys where id = $1 for update")
+                    .bind(key_id.as_str())
+                    .fetch_optional(&mut *tx),
+            )
+            .await
+            .map_err(|source| unavailable().with_source(source))?
+            .ok_or_else(|| {
+                GatewayError::new(
+                    GatewayErrorKind::Unauthorized,
+                    "client API key no longer exists",
+                )
+            })?;
             advance_windows(&mut tx, key_id.as_str(), now, now, self.timezone)
                 .await
                 .map_err(|source| unavailable().with_source(source))?;
@@ -290,24 +302,30 @@ impl PgClientBudgetStore {
         let Some(first) = charges.first() else {
             return Ok(());
         };
-        let mut tx = self
-            .pool
-            .begin()
+        let mut tx = trace_operation("client_budget_settle", "pool_begin", self.pool.begin())
             .await
             .map_err(|source| ClientBudgetError(Some(source.into())))?;
         // 与窗口开启和重置统一先锁 Key，再写窗口和费用
-        let key = sqlx::query_scalar::<_, String>(
-            "select id from client_api_keys where id = $1 for update",
+        let key = trace_operation(
+            "client_budget_settle",
+            "key_lock",
+            sqlx::query_scalar::<_, String>(
+                "select id from client_api_keys where id = $1 for update",
+            )
+            .bind(first.key_id.as_str())
+            .fetch_optional(&mut *tx),
         )
-        .bind(first.key_id.as_str())
-        .fetch_optional(&mut *tx)
         .await
         .map_err(|source| ClientBudgetError(Some(source.into())))?;
         let Some(key) = key else { return Ok(()) }; // 删除 Key 时也会删除其费用记录
-        settle_in_transaction(&mut tx, &key, charges, self.timezone)
-            .await
-            .map_err(|source| ClientBudgetError(Some(source.into())))?;
-        tx.commit()
+        trace_operation(
+            "client_budget_settle",
+            "sql",
+            settle_in_transaction(&mut tx, &key, charges, self.timezone),
+        )
+        .await
+        .map_err(|source| ClientBudgetError(Some(source.into())))?;
+        trace_operation("client_budget_settle", "commit", tx.commit())
             .await
             .map_err(|source| ClientBudgetError(Some(source.into())))
     }

@@ -18,6 +18,7 @@ mod pricing;
 mod provider_accounts;
 mod proxies;
 mod query_pattern;
+mod query_trace;
 mod retention;
 mod runtime_settings;
 mod snapshot;

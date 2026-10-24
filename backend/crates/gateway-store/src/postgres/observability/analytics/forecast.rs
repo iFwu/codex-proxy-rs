@@ -270,11 +270,13 @@ impl AnalyticsSnapshot<'_> {
                 'excluded_request_count',count(*) filter(where not included and completed_at is not null and outcome <> 'running')) as counts,
                 jsonb_build_object('USD',coalesce(sum(cost_amount) filter(where included and known_cost),0)::text) as costs,
                 '{}'::jsonb as distributions,null::timestamptz as last_used_at from classified group by slot");
-        query
-            .build()
-            .fetch_all(&mut *self.tx)
-            .await
-            .map_err(|error| postgres_unavailable("read exact forecast boundaries", error))
+        crate::postgres::query_trace::trace_operation(
+            "forecast_facts",
+            "sql",
+            query.build().fetch_all(&mut *self.tx),
+        )
+        .await
+        .map_err(|error| postgres_unavailable("read exact forecast boundaries", error))
     }
 }
 

@@ -604,19 +604,53 @@ where
         Err(error) => {
             state.record_write_failure();
             let stats = state.snapshot();
-            if !stats.write_failure_total.is_power_of_two() {
+            if operation != "finalize_model_request" && !stats.write_failure_total.is_power_of_two()
+            {
                 return false;
             }
+            let (validation_reason, sqlstate) = write_failure_details(&error);
             tracing::warn!(
                 operation,
-                request_id = ?request_id,
+                request_id = request_id.as_deref(),
                 error_kind = ?error.kind(),
                 write_failure_total = stats.write_failure_total,
+                validation_reason,
+                sqlstate,
+                queued_items = stats.queued_items,
+                queued_bytes = stats.queued_bytes,
                 "执行观测写入失败，数据面不受影响"
             );
             false
         }
     }
+}
+
+fn write_failure_details(error: &StoreError) -> (Option<&'static str>, Option<&str>) {
+    let mut validation_reason = None;
+    let mut sqlstate = None;
+    let mut current = std::error::Error::source(error);
+    // 与受限错误快照保持相同的深度上限，不格式化任意错误来源
+    for _ in 0..32 {
+        let Some(source) = current else {
+            break;
+        };
+        if let Some(validation) =
+            source.downcast_ref::<super::execution::ExecutionValidationError>()
+        {
+            validation_reason = Some(validation.reason);
+        }
+        // SQLx 的数据库错误需显式解包，普通 source 链不保证暴露具体后端类型
+        if let Some(database) = source
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|error| error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>())
+            .or_else(|| source.downcast_ref::<sqlx::postgres::PgDatabaseError>())
+        {
+            sqlstate = Some(database.code());
+        }
+        current = source.source();
+    }
+    (validation_reason, sqlstate)
 }
 
 async fn drain_on_shutdown<S>(
