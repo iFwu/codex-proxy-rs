@@ -3,7 +3,7 @@
 use serde::Serialize;
 use serde_json::value::RawValue;
 
-use super::{ModelRequestFinalization, NewModelRequest, StoreResult, invalid};
+use super::{ModelRequestFinalization, NewModelRequest, StoreResult, invalid, invalid_with_source};
 
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -177,7 +177,9 @@ impl RequestObservation {
                 group_names_snapshot: serde_json::from_value(
                     request.routing_group_names_snapshot.clone(),
                 )
-                .map_err(|source| invalid("invalid routing group names").with_source(source))?,
+                .map_err(|source| {
+                    invalid_with_source("invalid routing group names", Some(source.into()))
+                })?,
             }),
             scheduling: Some(SchedulingObservation {
                 admission_decision_ms: request.admission_decision_ms,
@@ -270,14 +272,17 @@ impl RequestObservation {
 
     fn encode(self) -> StoreResult<sqlx::types::Json<Box<RawValue>>> {
         // 类型化事实只编码一次，SQLx 复用原始 JSON 文本，避免 Value 树与第二次长度序列化
-        let text = serde_json::to_string(&self)
-            .map_err(|source| invalid("encode request observation").with_source(source))?;
+        let text = serde_json::to_string(&self).map_err(|source| {
+            invalid_with_source("encode request observation", Some(source.into()))
+        })?;
         if text.len() > 1024 * 1024 {
             return Err(invalid("request observation exceed 1 MiB"));
         }
         RawValue::from_string(text)
             .map(sqlx::types::Json)
-            .map_err(|source| invalid("encode request observation").with_source(source))
+            .map_err(|source| {
+                invalid_with_source("encode request observation", Some(source.into()))
+            })
     }
 }
 

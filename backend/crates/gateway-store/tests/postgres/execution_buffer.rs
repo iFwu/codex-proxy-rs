@@ -20,6 +20,7 @@ use gateway_core::task::{DaemonTask as _, WorkerDaemonContext};
 use gateway_core::upstream::UpstreamSendState;
 use gateway_store::postgres::{BufferedExecutionStore, PgExecutionStore};
 use tokio::sync::{Notify, Semaphore};
+use tracing::instrument::WithSubscriber as _;
 
 use super::{
     TestDatabase,
@@ -968,6 +969,114 @@ async fn zero_attempt_postgres_write_failures_are_not_retried_and_do_not_stop_th
     assert_eq!(recovered.request.attempt_count, 0);
     assert!(recovered.attempts.is_empty());
     assert_eq!(recovered.trace, None);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn terminal_write_failures_keep_safe_details_without_sampling() {
+    let Some(database) = TestDatabase::create("terminal_failure_logging").await else {
+        return;
+    };
+    sqlx::raw_sql(
+        "create function reject_terminal_observation() returns trigger language plpgsql as $$
+         begin
+           if NEW.id = 'req_terminal_sql_error' and NEW.outcome = 'failed' then
+             raise exception 'PRIVATE_DATABASE_MESSAGE'
+               using errcode = '23514', detail = 'PRIVATE_SQL_PARAMETER';
+           end if;
+           return NEW;
+         end $$;
+         create trigger reject_terminal_observation before update on model_requests
+         for each row execute function reject_terminal_observation();",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("install isolated terminal failure");
+    let inner = Arc::new(PgExecutionStore::new(database.pool.clone()));
+    let (store, writer) =
+        BufferedExecutionStore::with_capacity(Arc::clone(&inner), NonZeroUsize::new(8).unwrap());
+    let cases = [
+        (
+            "req_terminal_invalid_json",
+            Some("PRIVATE_PROVIDER_METADATA"),
+            Some("provider observation JSON is invalid"),
+        ),
+        (
+            "req_terminal_non_object",
+            Some("[\"PRIVATE_PROVIDER_METADATA\"]"),
+            Some("provider observation must be a JSON object"),
+        ),
+        ("req_terminal_sql_error", None, None),
+    ];
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(Arc::new(log.reopen().unwrap()))
+        .finish();
+    for (id, metadata, _) in cases {
+        let request = accepted_request(id);
+        inner.create_model_request(request.clone()).await.unwrap();
+        let mut finalization = early_failure(&request);
+        finalization.provider_metadata_json = metadata.map(str::to_owned);
+        store.finalize_model_request(finalization).await.unwrap();
+    }
+    let healthy = accepted_request("req_terminal_after_failure");
+    inner.create_model_request(healthy.clone()).await.unwrap();
+    store
+        .finalize_model_request(early_failure(&healthy))
+        .await
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    writer
+        .run(WorkerDaemonContext::new(cancellation))
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    let body = std::fs::read_to_string(log.path()).unwrap();
+    let records: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|record: &serde_json::Value| {
+            record["fields"]["operation"] == "finalize_model_request"
+        })
+        .collect();
+    assert_eq!(records.len(), cases.len());
+    for (id, _, reason) in cases {
+        let fields = &records
+            .iter()
+            .find(|record| record["fields"]["request_id"] == id)
+            .expect("each failed request has a correlatable log")["fields"];
+        assert_eq!(fields["validation_reason"].as_str(), reason);
+        assert_eq!(
+            fields["sqlstate"].as_str(),
+            if reason.is_none() {
+                Some("23514")
+            } else {
+                None
+            }
+        );
+    }
+    for secret in [
+        "PRIVATE_PROVIDER_METADATA",
+        "PRIVATE_DATABASE_MESSAGE",
+        "PRIVATE_SQL_PARAMETER",
+    ] {
+        assert!(
+            !body.contains(secret),
+            "sensitive failure detail reached ordinary logs"
+        );
+    }
+    assert_eq!(store.stats().write_failure_total, 3);
+    assert_eq!(store.stats().persisted_total, 1);
+    assert_eq!(store.stats().queued_items, 0);
+    let outcome: String = sqlx::query_scalar("select outcome from model_requests where id = $1")
+        .bind(healthy.id.as_str())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(outcome, "failed");
     database.close().await;
 }
 

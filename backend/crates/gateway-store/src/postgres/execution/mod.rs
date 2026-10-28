@@ -546,7 +546,7 @@ impl ModelRequestRepository for PgExecutionStore {
         .bind(attempt.http_version)
         .bind(
             i32::try_from(attempt.attempt_count)
-                .map_err(|source| invalid("attempt_count is too large").with_source(source))?,
+                .map_err(|source| invalid_with_source("attempt_count is too large", Some(source.into())))?,
         )
         .bind(optional_i64(
             attempt.account_selection_wait_ms,
@@ -570,7 +570,7 @@ impl ModelRequestRepository for PgExecutionStore {
             kind: ConflictKind::InvalidTransition,
         })?;
         u32::try_from(count)
-            .map_err(|source| invalid("attempt_count is invalid").with_source(source))
+            .map_err(|source| invalid_with_source("attempt_count is invalid", Some(source.into())))
     }
 
     async fn mark_upstream_send_state(
@@ -744,7 +744,7 @@ impl ModelRequestRepository for PgExecutionStore {
         .bind(finalization.upstream_send_state.as_str())
         .bind(
             i32::try_from(finalization.attempt_count)
-                .map_err(|source| invalid("attempt_count is too large").with_source(source))?,
+                .map_err(|source| invalid_with_source("attempt_count is too large", Some(source.into())))?,
         )
         .bind(finalization.downstream_committed_at)
         .bind(finalization.client_status_code.map(i32::from))
@@ -1109,12 +1109,19 @@ impl ExecutionStore for PgExecutionStore {
             .as_deref()
             .map(serde_json::from_str::<Value>)
             .transpose()
-            .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source))?;
+            .map_err(|source| {
+                core_store_error(invalid_with_source(
+                    "provider observation JSON is invalid",
+                    Some(source.into()),
+                ))
+            })?;
         if provider_metadata_json
             .as_ref()
             .is_some_and(|metadata| !metadata.is_object())
         {
-            return Err(CoreStoreError::new(CoreStoreErrorKind::InvalidData));
+            return Err(core_store_error(invalid(
+                "provider observation must be a JSON object",
+            )));
         }
         let (cost_source, cost_amount, cost_currency) = match finalization.cost.total() {
             Some(total) => (
@@ -1125,7 +1132,10 @@ impl ExecutionStore for PgExecutionStore {
                         .to_string()
                         .parse::<DecimalAmount>()
                         .map_err(|source| {
-                            CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source)
+                            core_store_error(invalid_with_source(
+                                "cost amount conversion is invalid",
+                                Some(source.into()),
+                            ))
                         })?,
                 ),
                 Some(total.currency().as_str().to_owned()),
@@ -1180,7 +1190,10 @@ impl ExecutionStore for PgExecutionStore {
                     .map(serde_json::from_str)
                     .transpose()
                     .map_err(|source| {
-                        CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source)
+                        core_store_error(invalid_with_source(
+                            "diagnostic trace JSON is invalid",
+                            Some(source.into()),
+                        ))
                     })?,
                 error_kind,
                 provider_error_code: finalization.provider_error_code,
@@ -1369,7 +1382,7 @@ fn validate_status_code(status: Option<u16>) -> StoreResult<()> {
     Ok(())
 }
 
-fn validate_optional_stable_reason(value: Option<&str>, field: &str) -> StoreResult<()> {
+fn validate_optional_stable_reason(value: Option<&str>, field: &'static str) -> StoreResult<()> {
     if value.is_some_and(|value| {
         value.is_empty()
             || value.len() > 64
@@ -1416,12 +1429,34 @@ fn validate_connection_observation(finalization: &ModelRequestFinalization) -> S
 }
 
 fn to_i64(value: u64, field: &'static str) -> StoreResult<i64> {
-    i64::try_from(value).map_err(|source| invalid(field).with_source(source))
+    i64::try_from(value).map_err(|source| invalid_with_source(field, Some(source.into())))
 }
 
-fn invalid(message: &str) -> StoreError {
+/// 普通日志只读取静态校验原因，原始来源仍由受限错误链保存
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+pub(super) struct ExecutionValidationError {
+    pub(super) reason: &'static str,
+    #[source]
+    source: Option<gateway_core::error::ErrorSource>,
+}
+
+fn invalid(message: &'static str) -> StoreError {
+    invalid_with_source(message, None)
+}
+
+fn invalid_with_source(
+    message: &'static str,
+    source: Option<gateway_core::error::ErrorSource>,
+) -> StoreError {
     StoreError::InvalidData {
-        source: None,
+        source: Some(
+            ExecutionValidationError {
+                reason: message,
+                source,
+            }
+            .into(),
+        ),
         entity: ENTITY,
         message: message.to_owned(),
     }
