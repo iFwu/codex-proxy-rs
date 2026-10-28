@@ -543,6 +543,8 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 - 开启后，OpenAI 每次成功取得 AT 和可用 RT 时，在资料补全及数据库写入前写入独立的 `oauth-recovery` 文件集
 - 该通道不受普通日志级别过滤，关闭时也不会改写到普通日志或 stdout；接收端不等待后台写入
 
+关闭 OAuth 恢复或请求转储不会抑制普通日志中的 WARN / ERROR；无需为排查普通告警开启敏感日志通道
+
 恢复记录和请求转储含原始凭据，`.runtime/logs` 须按敏感数据控制访问和备份
 
 每个文件输出使用非阻塞队列，普通额度为 4096 条 / 64 MiB，WARN / ERROR 另有 512 条 / 8 MiB 预留，
